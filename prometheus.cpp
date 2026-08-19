@@ -323,19 +323,33 @@ void initAll() {
     }
 
     // Between/Line BBs
+    //
+    // lineBB[s1][s2] must contain ONLY the single rank/file/diagonal shared by
+    // s1 and s2 (used by isLegal() to test "does a pinned piece's destination
+    // stay on the pin ray"). The previous formula OR'd s1's attacks (blocked
+    // at s2) with s2's attacks on an EMPTY board, which pulls in s1's *other*
+    // rank/file/diagonal too. Concretely, for a king on e1 pinned to e2 along
+    // the e-file, the old formula also included all of rank 1 and rank 2 in
+    // lineBB[e1][e2] - so a piece pinned on e2 could "legally" hop to f1
+    // (rank 1) even though that leaves the king in check on the e-file. This
+    // let the engine play moves that leave its own king in check.
+    // The correct construction intersects EMPTY-board attacks from both
+    // squares: a rook on s1 sees all of s1's rank+file; a rook on s2 sees all
+    // of s2's rank+file; the only squares common to both are the single
+    // rank-or-file line that actually passes through both squares.
     for (int s1=0; s1<64; s1++) for (int s2=0; s2<64; s2++) {
         betweenBB[s1][s2] = lineBB[s1][s2] = 0;
         if (s1==s2) continue;
         U64 r = rookAttSlow(s1, bit(s2));
         if (r & bit(s2)) {
             betweenBB[s1][s2] = r & rookAttSlow(s2, bit(s1));
-            lineBB[s1][s2] = (r | rookAttSlow(s2, 0)) | bit(s1) | bit(s2);
+            lineBB[s1][s2] = (rookAttSlow(s1,0) & rookAttSlow(s2,0)) | bit(s1) | bit(s2);
             continue;
         }
         U64 b2 = bishopAttSlow(s1, bit(s2));
         if (b2 & bit(s2)) {
             betweenBB[s1][s2] = b2 & bishopAttSlow(s2, bit(s1));
-            lineBB[s1][s2] = (b2 | bishopAttSlow(s2, 0)) | bit(s1) | bit(s2);
+            lineBB[s1][s2] = (bishopAttSlow(s1,0) & bishopAttSlow(s2,0)) | bit(s1) | bit(s2);
         }
     }
 
@@ -393,13 +407,19 @@ struct Position {
     int   rule50;
     int   gamePly;
     U64   hash;
-    StateInfo hist[512];
+    // Shadow history used only for repetition detection. Sized dynamically
+    // (instead of a fixed array) so it can never overflow: gamePly grows both
+    // from the real game (an arbitrarily long "position ... moves ..." list)
+    // and from search recursion (up to MAX_PLY deeper), and a fixed-size
+    // array here was a real out-of-bounds-write risk on long games.
+    vector<StateInfo> hist;
 
     void clear() {
         memset(bb, 0, sizeof(bb));
         memset(occ, 0, sizeof(occ));
         for (int i=0; i<64; i++) board[i]=EMPTY;
         side=WHITE; castling=0; epSq=-1; rule50=0; gamePly=0; hash=0;
+        if (hist.size() < 1024) hist.assign(1024, StateInfo{});
     }
 
     U64  pieces(PieceType pt, Color c) const { return bb[pt][c]; }
@@ -475,8 +495,9 @@ struct Position {
     void undoNull(const StateInfo& si);
     void setFen(const string& fen);
     string toFen() const;
-    bool isDraw(int ply) const;
+    bool isDraw() const;
     bool isRepetition() const;
+    void ensureHistCapacity(int ply);
     bool hasMajorPiece(Color c) const { return (bb[KNIGHT][c]|bb[BISHOP][c]|bb[ROOK][c]|bb[QUEEN][c])!=0; }
 };
 
@@ -530,6 +551,7 @@ void Position::doMove(Move m, StateInfo& si) {
     hash ^= zobCastle[castling];
     side = them; hash ^= zobSide;
     gamePly++;
+    ensureHistCapacity(gamePly);
     hist[gamePly] = si;
 }
 
@@ -559,7 +581,15 @@ void Position::doNull(StateInfo& si) {
     si.hash=hash; si.epSq=epSq; si.captured=EMPTY;
     if (epSq!=-1){hash^=zobEP[epSq&7]; epSq=-1;}
     side=~side; hash^=zobSide; gamePly++;
+    ensureHistCapacity(gamePly);
     hist[gamePly]=si;
+}
+
+// Grow the shadow history so hist[ply] is always a valid index. Amortized O(1);
+// in virtually all real games/searches this branch is false and never resizes,
+// since clear() pre-reserves 1024 slots (far beyond MAX_PLY + any realistic game length).
+void Position::ensureHistCapacity(int ply) {
+    if (ply >= (int)hist.size()) hist.resize(hist.size()*2 + 64);
 }
 void Position::undoNull(const StateInfo& si) {
     gamePly--; side=~side; hash=si.hash; epSq=si.epSq;
@@ -568,30 +598,62 @@ void Position::undoNull(const StateInfo& si) {
 bool Position::isLegal(Move m) const {
     int from=fromSq(m), to=toSq(m), flag=flagOf(m);
     Color us=side;
+    int ksq=king(us);
 
-    // Never capture a king — indicates search entered illegal position
-    if (board[to]!=EMPTY && typeOf(board[to])==KING) return false;
+    // En passant: verify no horizontal/diagonal pin exposing king
+    if (flag==EP_CAP) {
+        int capSq=to+(us==WHITE?-8:8);
+        U64 occ2=(all()^bit(from)^bit(capSq))|bit(to);
+        return !(getRookAtk(ksq,occ2)  &(bb[ROOK][~us]  |bb[QUEEN][~us]))&&
+               !(getBishopAtk(ksq,occ2)&(bb[BISHOP][~us]|bb[QUEEN][~us]));
+    }
 
-    // Castling: square-safety already checked during generation
+    // Castling: king safety already verified in move generation
     if (isCastle(m)) return true;
 
-    // Use make/unmake: correct for ALL cases (pins, discoveries, check evasions)
-    // Cost: ~40 ns per move — acceptable for correctness guarantee
-    Position& self = const_cast<Position&>(*this);
-    StateInfo si;
-    self.doMove(m, si);
-    bool legal = !self.inCheck(us);   // did we leave OUR king in check?
-    self.undoMove(m, si);
-    return legal;
+    // King moves: destination must not be attacked after king vacates
+    if (typeOf(board[from])==KING) {
+        U64 occ2=all()^bit(from);
+        return !attackersToByColor(to,occ2,~us);
+    }
+
+    // Non-king moves ---
+    // Rule 1: pinned piece must stay on pin ray
+    U64 pinned, pinners;
+    pinInfo(us, pinned, pinners);
+    if ((pinned & bit(from)) && !(lineBB[ksq][from] & bit(to)))
+        return false;
+
+    // Rule 2: if in check, must capture checker or block ray
+    U64 chk = attackersToByColor(ksq, all(), ~us);
+    if (chk) {
+        if (several(chk)) return false; // double check: only king can move
+        int checker = lsb(chk);
+        if (!(bit(to) & (bit(checker)|betweenBB[ksq][checker])))
+            return false;
+    }
+
+    return true;
 }
 
+// hist[k] stores the StateInfo captured BEFORE the move that produced ply k
+// (it exists to support undoMove), so hist[k].hash is actually the hash of
+// the position at ply (k-1), not at ply k. To compare the current position
+// against the position that was at ply j (same side to move, j = gamePly-2,
+// gamePly-4, ...), the correct lookup is therefore hist[j+1], not hist[j].
+// The previous version compared hist[gamePly-2], hist[gamePly-4], ... directly,
+// which are hashes from plies with the SIDE TO MOVE FLIPPED relative to the
+// current position - since the side-to-move bit is folded into the hash, those
+// comparisons could essentially never match, so repetition draws were never
+// detected in practice.
 bool Position::isRepetition() const {
-    for (int i=gamePly-2; i>=gamePly-rule50 && i>=0; i-=2)
-        if (hist[i].hash==hash) return true;
+    int limit = gamePly - rule50;
+    for (int j=gamePly-2; j>=limit && j>=0; j-=2)
+        if (hist[j+1].hash==hash) return true;
     return false;
 }
 
-bool Position::isDraw(int ply) const {
+bool Position::isDraw() const {
     if (rule50>=100) return true;
     if (isRepetition()) return true;
     // Insufficient material
@@ -603,6 +665,9 @@ bool Position::isDraw(int ply) const {
     return false;
 }
 
+// Known-good fallback used only if a FEN turns out to be unparseable/invalid.
+static const char* STARTPOS_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
 void Position::setFen(const string& fen) {
     clear();
     istringstream ss(fen);
@@ -610,6 +675,10 @@ void Position::setFen(const string& fen) {
     int hm=0, fm=1;
     ss>>brd>>sid>>cas>>ep>>hm>>fm;
 
+    // Board field: bounds-checked so a malformed string (too many pieces on a
+    // rank, a digit like '9', too many ranks, ...) can never push sq outside
+    // [0,63] into putPiece(), which would otherwise write past the end of
+    // board[64]/the bitboards (undefined behavior / memory corruption).
     int sq=A8;
     for (char c : brd) {
         if (c=='/') { sq-=16; continue; }
@@ -622,19 +691,40 @@ void Position::setFen(const string& fen) {
           case'r':p=B_ROOK;break;case'q':p=B_QUEEN;break;case'k':p=B_KING;break;
           default:continue;
         }
+        if (sq < 0 || sq > 63) break; // malformed board field: stop, don't write OOB
         putPiece(p,sq++);
     }
     side = (sid=="b") ? BLACK : WHITE;
     if (side==BLACK) hash^=zobSide;
     castling=0;
-    for (char c:cas){
-        if(c=='K')castling|=WK_C; if(c=='Q')castling|=WQ_C;
-        if(c=='k')castling|=BK_C; if(c=='q')castling|=BQ_C;
-    }
+    if (cas.find('K')!=string::npos) castling|=WK_C;
+    if (cas.find('Q')!=string::npos) castling|=WQ_C;
+    if (cas.find('k')!=string::npos) castling|=BK_C;
+    if (cas.find('q')!=string::npos) castling|=BQ_C;
     hash^=zobCastle[castling];
+
+    // En-passant field: validate both the characters and the resulting square
+    // before using it. epSq is later used to index pawnAtk[..][epSq] during
+    // move generation, so an unvalidated value here (e.g. from a garbled
+    // field like "ep" is a bare "x", or from a fuzzed FEN) was a real
+    // out-of-bounds read risk.
     epSq=-1;
-    if (ep!="-") { epSq=(ep[0]-'a')+(ep[1]-'1')*8; hash^=zobEP[epSq&7]; }
-    rule50=hm; gamePly=0;
+    if (ep.size()>=2 && ep[0]>='a' && ep[0]<='h' && ep[1]>='1' && ep[1]<='8') {
+        int cand = (ep[0]-'a') + (ep[1]-'1')*8;
+        if (cand>=0 && cand<64) { epSq=cand; hash^=zobEP[epSq&7]; }
+    }
+    rule50 = max(0, hm);
+    gamePly=0;
+
+    // A FEN missing a king (or with more than one per side) leaves king(c)
+    // calling lsb(0), which is undefined behavior and would then cascade into
+    // out-of-bounds table lookups all over move generation/eval. Reject and
+    // fall back to a known-good position instead of crashing.
+    if (popcount(bb[KING][WHITE])!=1 || popcount(bb[KING][BLACK])!=1) {
+        cerr << "info string Warning: invalid or incomplete FEN (need exactly one king per side); using startpos instead\n";
+        if (fen != STARTPOS_FEN) setFen(STARTPOS_FEN); // STARTPOS_FEN is always valid, so this cannot recurse further
+        return;
+    }
 }
 
 string Position::toFen() const {
@@ -652,8 +742,10 @@ string Position::toFen() const {
         if(r>0)fen+='/';
     }
     fen+=' '; fen+=(side==WHITE?'w':'b'); fen+=' ';
-    if(castling&WK_C)fen+='K'; if(castling&WQ_C)fen+='Q';
-    if(castling&BK_C)fen+='k'; if(castling&BQ_C)fen+='q';
+    if(castling&WK_C)fen+='K';
+    if(castling&WQ_C)fen+='Q';
+    if(castling&BK_C)fen+='k';
+    if(castling&BQ_C)fen+='q';
     if(!castling)fen+='-';
     fen+=' ';
     if(epSq!=-1){fen+='a'+fileOf(epSq);fen+='1'+rankOf(epSq);}else fen+='-';
@@ -707,8 +799,22 @@ void addPawnMoves(const Position& pos, MoveList& ml, bool capsOnly) {
 
     if (!capsOnly) {
         U64 push1=((us==WHITE)?shiftN(nonPromo):shiftS(nonPromo))&empty;
+        // Pawns that reached rank3 (white)/rank6 (black) via that single push
+        // are exactly the ones that started on their home rank - captured
+        // here BEFORE push1 is consumed by popLsb() below, since it's needed
+        // to compute the double push.
+        U64 push1FromHome = push1 & rank3;
         while(push1){int t=popLsb(push1); ml.push(t-dir,t,QUIET);}
-        U64 push2=((us==WHITE)?shiftN(shiftN(nonPromo&rank3)&empty):shiftS(shiftS(nonPromo&rank3)&empty))&empty;
+        // BUG FIX: this used to be shiftN(shiftN(nonPromo&rank3)&empty)&empty,
+        // i.e. it filtered CURRENT pawn positions by rank3 before pushing at
+        // all. Since pawns start the game on rank2, nonPromo&rank3 is empty
+        // at the start position (and stays wrong throughout), so this never
+        // generated a single legal double-push - e2e4, d2d4, and every other
+        // two-square pawn move were silently absent from move generation for
+        // the entire lifetime of this engine. The fix pushes from the
+        // *already-single-pushed* pawns that started on the home rank
+        // (push1FromHome, computed above) one square further.
+        U64 push2=((us==WHITE)?shiftN(push1FromHome):shiftS(push1FromHome))&empty;
         while(push2){int t=popLsb(push2); ml.push(t-2*dir,t,DPUSH);}
     }
 }
@@ -956,7 +1062,13 @@ struct PawnEntry {
     U64 passedPawns[2];
 };
 static const int PAWN_TABLE_SIZE = 16384;
-PawnEntry pawnTable[PAWN_TABLE_SIZE];
+// thread_local: with Lazy SMP, evaluate() runs concurrently on every search
+// thread. A single shared table here was read AND written by all threads at
+// once with no synchronization (a data race), which could hand back a
+// mismatched score for a given key. thread_local gives each OS thread its
+// own table (and, like any zero-initialized static/thread-local POD array,
+// it starts fully zeroed, so pe.key==0 correctly reads as "empty slot").
+thread_local PawnEntry pawnTable[PAWN_TABLE_SIZE];
 
 // King attack weights
 const int KA_PIECES[7] = {0, 1, 1, 2, 4, 0, 0};
@@ -967,9 +1079,6 @@ EvalScore evalPawns(const Position& pos, Color us) {
     U64 ourPawns = pos.bb[PAWN][us];
     U64 theirPawns = pos.bb[PAWN][them];
     U64 p = ourPawns;
-
-    U64 ourFill   = (us==WHITE)?fillNorth(ourPawns):fillSouth(ourPawns);
-    U64 theirFill = (us==WHITE)?fillSouth(theirPawns):fillNorth(theirPawns);
 
     while(p) {
         int sq = popLsb(p);
@@ -1149,8 +1258,22 @@ struct TT {
     U8 generation = 0;
 
     void resize(int mb) {
-        size = (mb * 1024 * 1024) / sizeof(array<TTEntry,2>);
-        table.assign(size, {});
+        mb = max(1, mb);
+        // Use size_t/64-bit arithmetic for the byte count: mb*1024*1024 as a
+        // plain 32-bit int computation could overflow for large mb.
+        size_t bytes = (size_t)mb * 1024ULL * 1024ULL;
+        size_t newSize = max((size_t)1, bytes / sizeof(array<TTEntry,2>));
+        try {
+            table.assign(newSize, {});
+            size = newSize;
+        } catch (const std::exception&) {
+            // Allocation failed (not enough memory available) - fall back to
+            // a small size instead of letting the exception crash the engine.
+            cerr << "info string Warning: could not allocate " << mb << " MB hash, falling back to 16 MB\n";
+            size_t fallback = max((size_t)1, (size_t)(16ULL*1024*1024) / sizeof(array<TTEntry,2>));
+            table.assign(fallback, {});
+            size = fallback;
+        }
         generation = 0;
     }
 
@@ -1211,14 +1334,22 @@ struct SearchInfo {
     Value bestScore = -VALUE_INF;
     int  completedDepth = 0;
 
-    int64_t nodes = 0;
+    // Incremented from every search thread concurrently (Lazy SMP), so this
+    // must be atomic - a plain int64_t here was a data race (undefined
+    // behavior, plus an unreliable node count and unreliable time checks).
+    atomic<int64_t> nodes{0};
 
     int64_t elapsed() const {
         return chrono::duration_cast<chrono::milliseconds>(
             chrono::high_resolution_clock::now() - startTime).count();
     }
     bool timeUp() const {
-        return stop || (timeLimit>0 && (nodes&4095)==0 && elapsed()>=timeLimit);
+        if (stop) return true;
+        int64_t n = nodes.load(memory_order_relaxed);
+        // "go nodes N": stop as soon as the node budget is reached.
+        if (maxNodes < INT64_MAX && n >= maxNodes) return true;
+        // Throttle the (comparatively expensive) clock read to every 4096 nodes.
+        return timeLimit>0 && (n&4095)==0 && elapsed()>=timeLimit;
     }
 };
 
@@ -1243,14 +1374,14 @@ struct ThreadData {
         memset(contHist,   0, sizeof(contHist));
     }
 
-    void updateHistory(Color c, Move m, int depth, const vector<Move>& quiets) {
+    void updateHistory(Color c, Move m, int depth, const Move* quiets, int quietsCount) {
         int bonus = min(depth*depth, 400);
         auto updateHH = [&](Move mv, int val) {
             int& h = history[c][fromSq(mv)][toSq(mv)];
             h += val - h * abs(val) / 400;
         };
         updateHH(m, bonus);
-        for (Move q : quiets) updateHH(q, -bonus);
+        for (int i=0;i<quietsCount;i++) updateHH(quiets[i], -bonus);
     }
 };
 
@@ -1282,9 +1413,20 @@ int scoreMove(const Position& pos, Move m, Move ttMove, int ply, const ThreadDat
     return td.history[c][fromSq(m)][toSq(m)];
 }
 
-void sortMoves(vector<pair<int,Move>>& scored) {
-    sort(scored.begin(), scored.end(), [](auto& a, auto& b){ return a.first > b.first; });
-}
+// Fixed-capacity replacement for vector<pair<int,Move>> in the hot search
+// path. qSearch/pvSearch build and sort one of these on every node visited
+// (potentially millions of times per second), so a heap allocation there is
+// pure overhead; MAX_MOVES safely bounds it (no chess position has more than
+// 218 legal moves) and this lives on the stack instead.
+struct ScoredMoveList {
+    array<pair<int,Move>, MAX_MOVES> entries;
+    int size = 0;
+    inline void push(int score, Move m) { entries[size++] = {score, m}; }
+    inline void sortDesc() {
+        sort(entries.begin(), entries.begin()+size,
+             [](const pair<int,Move>& a, const pair<int,Move>& b){ return a.first > b.first; });
+    }
+};
 
 // Forward declarations
 Value pvSearch(Position& pos, Value alpha, Value beta, int depth, int ply, bool cutNode, ThreadData& td);
@@ -1292,9 +1434,9 @@ Value qSearch (Position& pos, Value alpha, Value beta, int ply, ThreadData& td);
 
 Value qSearch(Position& pos, Value alpha, Value beta, int ply, ThreadData& td) {
     if (searchInfo.timeUp()) return 0;
-    searchInfo.nodes++;
+    searchInfo.nodes.fetch_add(1, memory_order_relaxed);
 
-    if (pos.isDraw(ply)) return VALUE_DRAW;
+    if (pos.isDraw()) return VALUE_DRAW;
     if (ply >= MAX_PLY)  return evaluate(pos);
 
     bool inCheck = pos.inCheck(pos.side);
@@ -1316,17 +1458,18 @@ Value qSearch(Position& pos, Value alpha, Value beta, int ply, ThreadData& td) {
     MoveList ml;
     generateMoves(pos, ml, !inCheck);
 
-    // Score and sort
-    vector<pair<int,Move>> scored;
-    for (int i=0;i<ml.size;i++) scored.push_back({scoreMove(pos,ml.moves[i],ttMove,ply,threads[0]),ml.moves[i]});
-    sortMoves(scored);
+    // Score and sort (stack-allocated: see ScoredMoveList)
+    ScoredMoveList scored;
+    for (int i=0;i<ml.size;i++) scored.push(scoreMove(pos,ml.moves[i],ttMove,ply,td),ml.moves[i]);
+    scored.sortDesc();
 
     Value best = inCheck ? -VALUE_INF : standPat;
     Move bestMove = MOVE_NONE;
     int moveCount = 0;
     StateInfo si;
 
-    for (auto& [sc, m] : scored) {
+    for (int idx=0; idx<scored.size; idx++) {
+        Move m = scored.entries[idx].second;
         if (!pos.isLegal(m)) continue;
         moveCount++;
 
@@ -1364,17 +1507,19 @@ Value qSearch(Position& pos, Value alpha, Value beta, int ply, ThreadData& td) {
 
 Value pvSearch(Position& pos, Value alpha, Value beta, int depth, int ply, bool cutNode, ThreadData& td) {
     if (searchInfo.timeUp()) return 0;
+    // This MUST be the first array-touching check: td.pvLen/td.pvLine are sized
+    // [MAX_PLY], so ply must be confirmed < MAX_PLY before any indexed write below.
+    if (ply >= MAX_PLY) return evaluate(pos);
 
     bool isPV = (beta > alpha+1);
     bool isRoot = (ply == 0);
 
     td.pvLen[ply] = ply;
 
-    if (!isRoot && pos.isDraw(ply)) return VALUE_DRAW;
+    if (!isRoot && pos.isDraw()) return VALUE_DRAW;
     if (depth <= 0) return qSearch(pos, alpha, beta, ply, td);
-    if (ply >= MAX_PLY) return evaluate(pos);
 
-    searchInfo.nodes++;
+    searchInfo.nodes.fetch_add(1, memory_order_relaxed);
 
     // TT probe
     bool ttHit; TTEntry* tte = tt.probe(pos.hash, ttHit);
@@ -1455,27 +1600,27 @@ Value pvSearch(Position& pos, Value alpha, Value beta, int depth, int ply, bool 
 
     // Generate and score all moves
     MoveList ml; generateMoves(pos, ml, false);
-    vector<pair<int,Move>> scored;
-    scored.reserve(ml.size);
-    for (int i=0;i<ml.size;i++) scored.push_back({scoreMove(pos,ml.moves[i],ttMove,ply,td),ml.moves[i]});
-    sortMoves(scored);
+    ScoredMoveList scored;
+    for (int i=0;i<ml.size;i++) scored.push(scoreMove(pos,ml.moves[i],ttMove,ply,td),ml.moves[i]);
+    scored.sortDesc();
 
     Value best = -VALUE_INF;
     Move bestMove = MOVE_NONE;
     int moveCount = 0;
-    bool foundPV = false;
-    vector<Move> quietsTried;
+    array<Move, MAX_MOVES> quietsTried;
+    int quietsCount = 0;
     StateInfo si;
 
-    for (auto& [sc, m] : scored) {
+    for (int scIdx=0; scIdx<scored.size; scIdx++) {
+        Move m = scored.entries[scIdx].second;
         if (!pos.isLegal(m)) continue;
         moveCount++;
 
         bool isQuiet = !isCapture(m) && !isPromotion(m);
         int  newDepth = depth - 1;
 
-        // Singular extension
-        bool singular = false;
+        // Singular extension: if the TT move is the only move that avoids a
+        // big score drop, extend the search by one ply on that move.
         if (!isRoot && depth>=8 && m==ttMove && !inCheck &&
             ttHit && (int)tte->depth >= depth-3 && tte->flag==TT_LOWER &&
             abs(ttValue)<VALUE_MATE_THRESH) {
@@ -1483,7 +1628,7 @@ Value pvSearch(Position& pos, Value alpha, Value beta, int depth, int ply, bool 
             // Search all moves except ttMove
             // (simplified: just do reduced search)
             Value singScore = pvSearch(pos, singBeta-1, singBeta, (depth-1)/2, ply, cutNode, td);
-            if (singScore < singBeta) { newDepth++; singular=true; }
+            if (singScore < singBeta) newDepth++;
             else if (singBeta >= beta) return singBeta; // multicut
         }
 
@@ -1545,14 +1690,14 @@ Value pvSearch(Position& pos, Value alpha, Value beta, int depth, int ply, bool 
                             td.killers[ply][1] = td.killers[ply][0];
                             td.killers[ply][0] = m;
                         }
-                        td.updateHistory(pos.side, m, depth, quietsTried);
+                        td.updateHistory(pos.side, m, depth, quietsTried.data(), quietsCount);
                     }
                     tt.store(pos.hash, m, tt.valueToTT(v,ply), staticEval, depth, TT_LOWER, isPV);
                     return v;
                 }
             }
         }
-        if (isQuiet) quietsTried.push_back(m);
+        if (isQuiet && quietsCount < MAX_MOVES) quietsTried[quietsCount++] = m;
     }
 
     if (moveCount == 0) {
@@ -1633,6 +1778,20 @@ void search(Position& pos, SearchInfo& info, int numThreads=1) {
     Move  bestMove = MOVE_NONE;
     Value bestScore = -VALUE_INF;
 
+    // Safety net: seed bestMove with the first legal move before searching
+    // anything. If the search is stopped (very short movetime, an immediate
+    // "stop", or just very slow hardware) before depth 1 even finishes, the
+    // loop below breaks without ever assigning bestMove, and the engine would
+    // otherwise report "bestmove 0000" - not a legal move, and something a
+    // GUI may not handle gracefully - despite legal moves being available.
+    {
+        MoveList ml0; generateMoves(pos, ml0, false);
+        for (int i=0;i<ml0.size;i++) {
+            if (pos.isLegal(ml0.moves[i])) { bestMove = ml0.moves[i]; break; }
+        }
+        info.bestMove = bestMove;
+    }
+
     // Launch helper threads (Lazy SMP)
     vector<thread> helperThreads;
     for (int t=1; t<numThreads; t++) {
@@ -1684,8 +1843,9 @@ void search(Position& pos, SearchInfo& info, int numThreads=1) {
             if (i+1 < threads[0].pvLen[0]) pvStr+=' ';
         }
 
+        int64_t nodesNow = info.nodes.load(memory_order_relaxed);
         int64_t elapsed = max((int64_t)1, info.elapsed());
-        int64_t nps = info.nodes * 1000 / elapsed;
+        int64_t nps = nodesNow * 1000 / elapsed;
 
         // Score display
         string scoreStr;
@@ -1696,7 +1856,7 @@ void search(Position& pos, SearchInfo& info, int numThreads=1) {
 
         uciOutput("info depth " + to_string(depth) +
                   " score " + scoreStr +
-                  " nodes " + to_string(info.nodes) +
+                  " nodes " + to_string(nodesNow) +
                   " nps " + to_string(nps) +
                   " time " + to_string(elapsed) +
                   " pv " + pvStr);
@@ -1745,7 +1905,7 @@ void handlePosition(Position& pos, istringstream& is) {
         Move m = uciToMove(pos, token);
         if (m==MOVE_NONE) break;
         StateInfo si; pos.doMove(m, si);
-        pos.hist[pos.gamePly] = si;
+        // (doMove already records this state into pos.hist[pos.gamePly] internally.)
     }
 }
 
@@ -1753,6 +1913,7 @@ thread searchThread;
 
 void handleGo(Position& pos, istringstream& is) {
     int wtime=0,btime=0,winc=0,binc=0,movestogo=0,movetime=0,depth=MAX_PLY;
+    int64_t maxNodes = INT64_MAX;
     bool infinite=false, ponder=false;
     string token;
     while(is>>token){
@@ -1765,17 +1926,34 @@ void handleGo(Position& pos, istringstream& is) {
         else if(token=="depth")     is>>depth;
         else if(token=="infinite")  infinite=true;
         else if(token=="ponder")    ponder=true;
-        else if(token=="nodes")     is>>searchInfo.maxNodes;
+        // Read into a local, then assign once below - searchInfo.maxNodes is
+        // a persistent field, so writing it directly here meant a node limit
+        // from a previous "go nodes N" stayed active on every later "go"
+        // that didn't itself specify "nodes".
+        else if(token=="nodes")     is>>maxNodes;
     }
 
+    // Defensive clamp: a very large/garbled "go depth N" can't cause a crash
+    // (search recursion is independently bounded by MAX_PLY), but it can make
+    // a stored TT depth wrap when narrowed to the entry's 8-bit field, so keep
+    // it in the range the engine actually supports.
+    depth = max(1, min(depth, MAX_PLY));
+
     searchInfo.maxDepth = depth;
+    searchInfo.maxNodes = maxNodes;
     searchInfo.ponder = ponder;
     searchInfo.timeLimit = 0;
     searchInfo.softLimit = 0;
 
     if (movetime > 0) {
-        searchInfo.timeLimit = movetime - 10;
-        searchInfo.softLimit = movetime - 10;
+        // Clamp to a minimum of 1ms. "movetime - 10" alone goes negative for
+        // any movetime under 10ms, and timeUp() only checks the time budget
+        // when timeLimit>0 - so a fast/low-latency time control (common in
+        // engine-vs-engine testing) would silently disable the time check
+        // entirely and let the search run unbounded until maxDepth.
+        int64_t t = max((int64_t)1, (int64_t)movetime - 10);
+        searchInfo.timeLimit = t;
+        searchInfo.softLimit = t;
     } else if (!infinite && (wtime||btime)) {
         calcTime(wtime,btime,winc,binc,movestogo,pos.side,searchInfo);
     }
@@ -1810,8 +1988,27 @@ void uciLoop() {
         else if (token=="setoption") {
             string name; is>>name>>name; // skip "name"
             string val;  is>>val>>val;   // skip "value"
-            if (name=="Hash")    { tt.resize(stoi(val)); }
-            else if (name=="Threads") { numThreads = max(1,min(64,stoi(val))); }
+            // std::stoi throws on a missing/non-numeric/out-of-range value
+            // (e.g. a GUI sending "setoption name Hash" with no value at
+            // all). That exception was never caught, which meant a single
+            // malformed setoption line would take down the whole engine
+            // process. Validate and catch instead of trusting the input.
+            auto parseIntSafe = [](const string& s, int lo, int hi, int fallback)->int {
+                if (s.empty()) return fallback;
+                try {
+                    size_t consumed=0;
+                    int v = stoi(s, &consumed);
+                    return max(lo, min(hi, v));
+                } catch (...) {
+                    return fallback;
+                }
+            };
+            if (name=="Hash") {
+                tt.resize(parseIntSafe(val, 1, 4096, TT_SIZE_MB));
+            }
+            else if (name=="Threads") {
+                numThreads = parseIntSafe(val, 1, 64, numThreads);
+            }
             else if (name=="Clear") tt.clear();
         }
         else if (token=="ucinewgame") {
@@ -1833,8 +2030,7 @@ void uciLoop() {
         }
         else if (token=="quit") {
             searchInfo.stop = true;
-            if (searchThread.joinable()) searchThread.join();
-            break;
+            break; // cleanup (stopping + joining searchThread) happens once, right after this loop
         }
         else if (token=="d") {
             // Debug: print board
@@ -1848,16 +2044,30 @@ void uciLoop() {
             }
             cerr<<"FEN: "<<pos.toFen()<<'\n';
             cerr<<"Hash: "<<hex<<pos.hash<<dec<<'\n';
+            cerr<<"Repetition: "<<(pos.isRepetition()?"yes":"no")
+                <<"  Draw: "<<(pos.isDraw()?"yes":"no")
+                <<"  gamePly: "<<pos.gamePly<<"  rule50: "<<pos.rule50<<'\n';
         }
         else if (token=="eval") {
             cerr<<"Eval: "<<evaluate(pos)<<'\n';
         }
     }
+    // Reached both when the loop exits via "quit" (break, above) and when
+    // stdin simply hits EOF without a "quit" ever being sent (e.g. a script
+    // that pipes commands and closes the pipe, or a GUI/test harness that
+    // just kills the connection). Either way, an in-flight search thread
+    // must be stopped and joined here: a std::thread that is still
+    // "joinable" when its destructor runs (i.e. never joined/detached) calls
+    // std::terminate() and aborts the whole process. Previously this join
+    // only happened inside the "quit" branch, so ending the session any
+    // other way reliably crashed the engine on exit.
+    searchInfo.stop = true;
+    if (searchThread.joinable()) searchThread.join();
 }
 
 // ==================== MAIN ====================
 
-int main(int argc, char** argv) {
+int main(int /*argc*/, char** /*argv*/) {
     ios_base::sync_with_stdio(false);
     cin.tie(nullptr);
 
